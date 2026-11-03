@@ -1,0 +1,26 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# config & secrets
+.env
+data/
+downloads/
+
+# binaries (installed by scripts/install_tools.py)
+tools/
+
+# packaging artifacts kept out of repo
+*.zip
+*.tar.gz
+artifacts/
+
+# editors
+.idea/
+.vscode/

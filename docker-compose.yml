@@ -1,0 +1,9 @@
+services:
+  finderbot:
+    build: .
+    container_name: finderbot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads

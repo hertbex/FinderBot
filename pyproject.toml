@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "finderbot"
+version = "0.1.0"
+description = "Telegram bot: songs by name via Soulseek (sockseek) and videos from YouTube/TikTok/Instagram (yt-dlp)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram>=3.31",
+  "pydantic-settings>=2.7",
+  "aiosqlite>=0.21",
+  "cryptography>=44",
+  "yt-dlp>=2026.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.25",
+  "ruff>=0.9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/finderbot"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["SIM108", "SIM105"]
+
+[tool.ruff.lint.per-file-ignores]
+# В скриптах sys.path вручную — порядок импортов менять нельзя
+"scripts/*" = ["I001", "E402"]
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
