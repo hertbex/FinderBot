@@ -75,6 +75,20 @@ class Settings(BaseSettings):
     # Логи
     log_level: str = "INFO"
 
+    @field_validator("admin_user_id", mode="before")
+    @classmethod
+    def _empty_int_to_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("ytdlp_cookies", "ytdlp_proxy", "encrypt_key", mode="before")
+    @classmethod
+    def _empty_str_to_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("allowed_hosts", mode="before")
     @classmethod
     def _split_hosts(cls, value: object) -> object:
