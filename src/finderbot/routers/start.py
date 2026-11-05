@@ -63,7 +63,7 @@ async def cmd_status(
     lines.append(f"· {personal}" if personal else "· нет активных задач")
     stats = queue.stats()
     lines.append(
-        "\n🌐 Бот: воркеров {w}, выполняется {r}, в очереди {q}".format(
+        "\n🌐 Бот: воркеров {workers}, выполняется {running}, в очереди {queued}".format(
             **stats
         )
     )
