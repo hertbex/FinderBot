@@ -14,6 +14,8 @@ class CandidateEntry:
     query: str
     candidates: list[SlskResult]
     page: int = 0
+    star_first: bool = False          # пометить первый (лучший у STO) звездой
+    header_note: str = ""             # отчёт селектора: «найдено N · подходящих M…»
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -34,9 +36,17 @@ class CandidateRegistry:
         user_id: int,
         query: str,
         candidates: list[SlskResult],
+        star_first: bool = False,
+        header_note: str = "",
     ) -> CandidateEntry:
         key = (chat_id, message_id)
-        entry = CandidateEntry(user_id=user_id, query=query, candidates=candidates)
+        entry = CandidateEntry(
+            user_id=user_id,
+            query=query,
+            candidates=candidates,
+            star_first=star_first,
+            header_note=header_note,
+        )
         self._entries[key] = entry
         self._evict(len(self._entries) > self.MAX_ENTRIES)
         return entry

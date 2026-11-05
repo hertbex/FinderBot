@@ -1,4 +1,7 @@
-"""Музыка: текст → sockseek-поиск → inline-кнопки кандидатов → очередь → sendAudio."""
+"""Музыка: текст → многофазный sockseek-поиск (STO) → отбор → кнопки → queue → sendAudio
+Конвейер портирован из StreamToOffline: CandidateSelector (качество/длительность/
+версии) + STO-ранжирование. Лучший кандидат помечается ⭐.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +13,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from finderbot.config import Settings
 from finderbot.routers.candidates import CandidateEntry, CandidateRegistry
@@ -20,8 +28,15 @@ from finderbot.services.sender import Sender
 from finderbot.storage.creds import CredentialService
 from finderbot.tools.ffmpeg import cover_image
 from finderbot.tools.paths import ToolPaths
-from finderbot.tools.sockseek import SlskResult, SockseekClient, SockseekError, SockseekTimeout
-from finderbot.utils.formatting import human_size, parse_track_name, truncate
+from finderbot.tools.sockseek import (
+    SearchFlags,
+    SlskResult,
+    SockseekClient,
+    SockseekError,
+    SockseekTimeout,
+)
+from finderbot.tools.songselect import CandidateSelector, SelectionPolicy
+from finderbot.utils.formatting import human_duration, human_size, parse_track_name, truncate
 from finderbot.utils.urls import extract_url
 
 log = logging.getLogger(__name__)
@@ -31,10 +46,7 @@ PAGE_SIZE = 8
 MAX_CANDIDATES = 40
 CALLBACK_PREFIX = "sl"
 
-EXT_ORDER = {
-    "mp3": 0, "m4a": 1, "opus": 2, "ogg": 3, "wma": 4,
-    "flac": 5, "wav": 6, "ape": 7, "alac": 8, "aac": 9,
-}
+SELECTOR = CandidateSelector()
 
 _INVALID_PATH_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -53,35 +65,22 @@ async def _answer(cb: CallbackQuery, text: str, *, alert: bool = False) -> None:
         log.debug("Не удалось ответить на callback", exc_info=True)
 
 
-def _rank(result: SlskResult) -> tuple[int, int, int]:
-    """Сортировка: mp3 200+ в топ, фlaps следом, битый битрейт вниз."""
-    ext_rank = EXT_ORDER.get(result.ext, 9)
-    bitrate = result.bitrate or 2000  # lossless/flac считаем качественным
-    low_quality_penalty = 20 if (result.bitrate is not None and result.bitrate < 128) else 0
-    return (ext_rank + low_quality_penalty, -bitrate, result.size)
-
-
-def filter_audio(results: list[SlskResult], max_mb: int) -> list[SlskResult]:
-    limit = max_mb * 1024 * 1024
-    return [r for r in results if 0 < r.size <= limit]
-
-
 def _bitrate_tag(result: SlskResult) -> str:
     if result.bitrate:
         return f"{result.bitrate}k"
-    if result.bit_depth:
-        return "lossless" if result.ext == "flac" else f"{result.bit_depth}bit"
-    return result.ext
+    return "lossless" if result.ext in {"flac", "wav", "ape", "alac", "dsf", "wv"} else result.ext
 
 
-def _candidate_label(index: int, result: SlskResult) -> str:
-    return f"{index + 1}. {result.ext} {_bitrate_tag(result)[:14]}"
+def _candidate_label(index: int, result: SlskResult, *, star: bool = False) -> str:
+    prefix = "⭐ " if star else ""
+    return f"{prefix}{index + 1}. {result.ext} {_bitrate_tag(result)[:14]}"
 
 
-def _candidate_line(index: int, result: SlskResult) -> str:
+def _candidate_line(index: int, result: SlskResult, *, star: bool = False) -> str:
     peer = _html.escape(truncate(result.peer, 16))
+    prefix = "⭐ " if star else ""
     return (
-        f"{index + 1}. {peer} · {result.ext.upper()} {_bitrate_tag(result)} · "
+        f"{prefix}{index + 1}. {peer} · {result.ext.upper()} {_bitrate_tag(result)} · "
         f"{human_size(result.size)}"
     )
 
@@ -92,15 +91,18 @@ def _keyboard(entry: CandidateEntry) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for pair_start in range(0, len(visible), 2):
         pair = visible[pair_start : pair_start + 2]
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=_candidate_label(start + pair_start + offset, result),
-                    callback_data=f"{CALLBACK_PREFIX}:{start + pair_start + offset}",
-                )
-                for offset, result in enumerate(pair)
-            ]
-        )
+        row = [
+            InlineKeyboardButton(
+                text=_candidate_label(
+                    start + pair_start + offset,
+                    result,
+                    star=(start + pair_start + offset == 0 and entry.star_first),
+                ),
+                callback_data=f"{CALLBACK_PREFIX}:{start + pair_start + offset}",
+            )
+            for offset, result in enumerate(pair)
+        ]
+        rows.append(row)
     nav: list[InlineKeyboardButton] = [
         InlineKeyboardButton(text="✖ Закрыть", callback_data=f"{CALLBACK_PREFIX}:x")
     ]
@@ -113,13 +115,17 @@ def _keyboard(entry: CandidateEntry) -> InlineKeyboardMarkup:
 async def _render(bot, chat_id: int, message_id: int, entry: CandidateEntry) -> None:
     start = entry.page * PAGE_SIZE
     visible = entry.candidates[start : start + PAGE_SIZE]
-    header = (
-        f"🔎 «{_html.escape(truncate(entry.query, 40))}» — "
-        f"найдено {len(entry.candidates)} файла(ов). Выбери вариант:\n"
+    head = f"🔎 «{_html.escape(truncate(entry.query, 40))}»"
+    if entry.header_note:
+        head += "\n<i>" + entry.header_note + "</i>"
+    listing = "\n".join(
+        _candidate_line(
+            i, result, star=(entry.star_first and i == 0)
+        )
+        for i, result in enumerate(visible)
     )
-    listing = "\n".join(_candidate_line(i, result) for i, result in enumerate(visible))
     footer = f"\n<i>{start + 1}–{start + len(visible)} из {len(entry.candidates)}</i>"
-    text = f"{header}\n{listing}{footer}"
+    text = f"{head}\n{listing}{footer}"
     try:
         await bot.edit_message_text(
             text,
@@ -129,6 +135,14 @@ async def _render(bot, chat_id: int, message_id: int, entry: CandidateEntry) -> 
         )
     except Exception:  # noqa: BLE001
         log.exception("Не удалось отрисовать список")
+
+
+def _note_for(report, spec) -> str:
+    """Строка отчёта для шапки: найдено/подходит/отсекло + эталон длительности."""
+    length_note = ""
+    if spec.reference_duration:
+        length_note = f"⏱ ~{human_duration(spec.reference_duration)} · "
+    return f"{length_note}найдено {report.total}, подходит {report.eligible}; {report.summary()}"
 
 
 @router.message(F.text)
@@ -149,19 +163,24 @@ async def handle_song_query(
     if creds is None:
         await message.answer(
             "🔐 Для поиска песен нужен Soulseek-логин.\n"
-            "<b>/login</b> — подключить (можно зарегистрировать на slsknet.org, "
-            "или использовать существующий Wife/nicotine+)."
+            "<b>/login</b> — подключить. Аккаунт можно создать на slsknet.org, "
+            "если у вас его нет."
         )
         return
 
-    query = text[:128]
+    query = text[:160]
     status = await message.answer(
         f"⏳ Ищу «{_html.escape(truncate(query, 60))}» в Soulseek…"
     )
     progress = Progress(message.bot, message.chat.id, status.message_id)
+    search_flags = SearchFlags(
+        formats=settings.slsk_formats or None,
+        min_bitrate_kbps=settings.slsk_min_bitrate,
+        length_tolerance_seconds=settings.slsk_length_tolerance_sec,
+    )
     try:
         async with spinner(progress, f"Ищу «{_html.escape(truncate(query, 40))}»"):
-            results = await sockseek.search(creds, query)
+            results, spec = await sockseek.search(creds, query, flags=search_flags)
     except SockseekTimeout as exc:
         await progress.fail(str(exc))
         return
@@ -169,19 +188,61 @@ async def handle_song_query(
         await progress.fail(str(exc))
         return
 
-    good = filter_audio(results, settings.max_file_mb)
-    if not good:
+    if not results:
+        hint = (
+            "Запрос без распознавания «артист - title» — попробовали каскад "
+            "artist=/title=/свободный текст."
+            if not spec.artist or not spec.title
+            else ""
+        )
         await progress.finish(
-            "😕 Ничего не нашлось. Попробуйте иначе: «артист - название» или "
-            "проверьте /login."
+            "😕 Ничего не нашлось. " + hint + "Проверьте /login и переформулируйте: "
+            "«артист - трек» (можно с длительностью: «(3:45)»)."
         )
         return
-    good.sort(key=_rank)
-    del good[MAX_CANDIDATES:]
-    entry = candidates.put(
-        message.chat.id, status.message_id, user_id=user_id, query=query, candidates=good,
+
+    policy = SelectionPolicy(
+        min_bitrate_kbps=settings.slsk_min_bitrate,
+        version_policy=settings.slsk_version_policy,
+        length_tolerance_seconds=settings.slsk_length_tolerance_sec,
+        max_size_bytes=settings.max_file_mb * 1024 * 1024,
     )
-    await progress.update(f"🔍 Найдено: {len(good)}")
+    eligible, report = SELECTOR.rank(results, spec, policy)
+
+    if eligible:
+        chosen = eligible[:MAX_CANDIDATES]
+        entry = candidates.put(
+            message.chat.id,
+            status.message_id,
+            user_id=user_id,
+            query=(spec.artist and spec.title and f"{spec.artist} - {spec.title}") or spec.raw,
+            candidates=chosen,
+            star_first=True,
+            header_note=_html.escape(_note_for(report, spec)),
+        )
+        await progress.update(
+            f"🔍 {_html.escape(str(report.total))}·подходит {report.eligible}"
+        )
+        await _render(message.bot, message.chat.id, status.message_id, entry)
+        return
+
+    # STO-фильтры выжили всех: показываем сырую выдачу, отранжированную как STO
+    ranked = sorted(results, key=lambda r: SELECTOR._rank(r, spec), reverse=True)  # noqa: SLF001
+    del ranked[MAX_CANDIDATES:]
+    note = (
+        f"⚠️ фильтры отбросили все {report.total} кандидата(ов) — "
+        f"{_html.escape(report.summary())}"
+    )
+    entry = candidates.put(
+        message.chat.id,
+        status.message_id,
+        user_id=user_id,
+        query=(spec.artist and spec.title and f"{spec.artist} - {spec.title}") or spec.raw,
+        candidates=ranked,
+        star_first=False,
+        header_note=note,
+    )
+    await progress.update(f"⚠️ подходит 0 из {report.total} — показываю всё")
     await _render(message.bot, message.chat.id, status.message_id, entry)
 
 
@@ -230,7 +291,7 @@ async def handle_candidate(
     result = entry.candidates[index]
     creds = await credentials.get(entry.user_id)
     if creds is None:
-        await _answer(cb, "Аккаунт disconnect — используйте /login.", alert=True)
+        await _answer(cb, "Аккаунт отключился — используйте /login.", alert=True)
         return
 
     label = f"{truncate(entry.query, 32)} · {result.ext}"
@@ -255,7 +316,7 @@ async def handle_candidate(
         log.exception("Не удалось обновить сообщение")
 
 
-# --- фон скачивания ---------------------------------------------------------
+# --- фоновое скачивание ------------------------------------------------------
 
 
 def _sanitize_name(name: str) -> str:

@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     ytdlp_proxy: str | None = None
     ytdlp_cookies: Path | None = None
 
+    # --- Поиск песни (конвейер в духе StreamToOffline) ---
+    slsk_formats: str = "mp3,flac,m4a,wav,ogg"   # --format у sockseek
+    slsk_version_policy: str = "auto"            # auto|all|original|edits|remixes
+    slsk_length_tolerance_sec: int = 5           # допуск к (M:SS) из запроса
+    slsk_min_bitrate: int | None = None          # минимальный битрейт lossy
+
     # Шифрование per-user кредов; если не задано — создаётся data/secret.key
     encrypt_key: str | None = None
 
@@ -75,12 +81,22 @@ class Settings(BaseSettings):
     # Логи
     log_level: str = "INFO"
 
-    @field_validator("admin_user_id", mode="before")
+    @field_validator("admin_user_id", "slsk_min_bitrate", mode="before")
     @classmethod
     def _empty_int_to_none(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("slsk_version_policy", mode="before")
+    @classmethod
+    def _check_version_policy(cls, value: object) -> object:
+        value_str = str(value or "").strip().lower() or "auto"
+        if value_str not in ("auto", "all", "original", "edits", "remixes"):
+            raise ValueError(
+                "SLSK_VERSION_POLICY допустимы: auto|all|original|edits|remixes"
+            )
+        return value_str
 
     @field_validator("ytdlp_cookies", "ytdlp_proxy", "encrypt_key", mode="before")
     @classmethod
